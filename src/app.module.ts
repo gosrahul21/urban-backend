@@ -20,6 +20,7 @@ import { DeviceModule } from './modules/device/device.module';
       validationSchema: Joi.object({
         MONGODB_URI: Joi.string().required(),
         PORT: Joi.number().required(),
+        JWT_SECRET: Joi.string().required(),
       }),
     }),
     MongooseModule.forRoot(process.env.MONGODB_URI!),
