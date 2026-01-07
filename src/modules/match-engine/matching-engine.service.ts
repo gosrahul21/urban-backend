@@ -152,14 +152,87 @@ export class ServiceMatchingService implements OnModuleInit, OnModuleDestroy {
     const order = await this.orderModel.findById(orderId);
     if (!order || order.status !== OrderStatus.CONFIRMED) return;
 
-    const excludedSpIds = await this.matchModel.distinct('serviceProviderId', {
-      orderId,
-    });
+    const orderDateKey = new Date(order.scheduledAt!)
+      .toISOString()
+      .slice(0, 10);
+    const excludedSpIds = new Set<string>(
+      await this.matchModel.distinct('serviceProviderId', {
+        orderId,
+      }),
+    );
 
     const date = new Date(order.scheduledAt!);
+    const typedOrder = order as Order & {
+      totalDuration?: number;
+      cityId?: string;
+      items?: Array<{ serviceId: string }>;
+    };
     const dayOfWeek = date.getDay();
     const startMinute = date.getHours() * 60 + date.getMinutes();
-    const endMinute = startMinute + (order as any).totalDuration;
+    const endMinute = startMinute + (typedOrder.totalDuration ?? 0);
+
+    // Exclude providers that already accepted an overlapping order on the same day
+    const busySpIds: Array<{ serviceProviderId: string }> =
+      await this.matchModel.aggregate([
+        { $match: { status: ProviderMatchStatus.ACCEPTED } },
+        {
+          $lookup: {
+            from: this.orderModel.collection.name,
+            localField: 'orderId',
+            foreignField: '_id',
+            as: 'order',
+          },
+        },
+        { $unwind: '$order' },
+        {
+          $addFields: {
+            orderDate: {
+              $dateToString: { format: '%Y-%m-%d', date: '$order.scheduledAt' },
+            },
+            orderTimeParts: { $dateToParts: { date: '$order.scheduledAt' } },
+          },
+        },
+        {
+          $addFields: {
+            orderStartMinute: {
+              $add: [
+                {
+                  $multiply: [{ $ifNull: ['$orderTimeParts.hour', 0] }, 60],
+                },
+                { $ifNull: ['$orderTimeParts.minute', 0] },
+              ],
+            },
+            orderEndMinute: {
+              $add: [
+                {
+                  $add: [
+                    {
+                      $multiply: [{ $ifNull: ['$orderTimeParts.hour', 0] }, 60],
+                    },
+                    { $ifNull: ['$orderTimeParts.minute', 0] },
+                  ],
+                },
+                { $ifNull: ['$order.totalDuration', 0] },
+              ],
+            },
+          },
+        },
+        {
+          $match: {
+            orderDate: orderDateKey,
+            $expr: {
+              $and: [
+                { $lt: ['$orderStartMinute', endMinute] },
+                { $gt: ['$orderEndMinute', startMinute] },
+              ],
+            },
+          },
+        },
+        { $project: { serviceProviderId: 1 } },
+      ]);
+
+    busySpIds.forEach((busy) => excludedSpIds.add(busy.serviceProviderId));
+    const excludedSpArray = Array.from(excludedSpIds);
 
     const availableSpIds = await this.availabilityModel.distinct(
       'serviceProviderId',
@@ -173,13 +246,11 @@ export class ServiceMatchingService implements OnModuleInit, OnModuleDestroy {
     const sp = await this.spModel.findOne({
       _id: {
         $in: availableSpIds,
-        $nin: excludedSpIds,
+        $nin: excludedSpArray,
       },
-      cityId: (order as any).cityId,
+      cityId: typedOrder.cityId,
       serviceIds: {
-        $in:
-          (order as any).items?.map((i: any) => i.serviceId) ||
-          order.serviceIds,
+        $in: typedOrder.items?.map((i) => i.serviceId) || order.serviceIds,
       },
       status: ServiceProviderStatus.AVAILABLE,
       isActive: true,
